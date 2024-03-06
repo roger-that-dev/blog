@@ -1,0 +1,14 @@
+<article>
+    <h1>{{ Post.FrontMatter.Title }}</h1>
+    <div>
+        <p>{{ Post.FrontMatter.Date }}</p>
+        <p>{{ Post.FrontMatter.Author }}</p>
+    </div>
+    <div>
+        {{ Post.Content ~}}
+    </div>
+    <div>
+        <p>{{ for Tag in Post.FrontMatter.Tags }} #{{ Tag ~}} {{ end }}</p>
+    </div>
+</article>
+`
