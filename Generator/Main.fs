@@ -47,26 +47,34 @@ module Main =
           MultiPage
               { Name = "Post"
                 Template = "templates/pages/post.tmpl"
-                PageGenerator = Generator.postGenerator } ]
+                PageGenerator = Generator.postGenerator }
+          SinglePage
+              { Name = "Home"
+                Template = "templates/pages/home.tmpl"
+                PageGenerator = Generator.homeGenerator } ]
 
     /// Entry point for when testing with FSI.
     let start markdownPath outputPath =
+        let parseFn = Post.fromMarkdown Markdown.newParser
+
         result {
             let! markdownFiles = enumerateMarkdownFiles markdownPath |> Result.mapError List.singleton
-            let! posts = markdownFiles |> List.map Post.fromMarkdown |> Result.combine
+            let! posts = markdownFiles |> List.map parseFn |> Result.combine
 
             let results =
                 pages
                 |> List.map (fun page ->
                     match page with
                     | FixedPage p ->
-                        Generator.staticGenerator p.Template outputPath p.URL
+                        Generator.staticPage p.Template outputPath p.URL
                         |> Result.mapError List.singleton
                     | MultiPage p -> p.PageGenerator p.Template outputPath posts
                     | SinglePage p -> p.PageGenerator p.Template outputPath posts |> Result.mapError List.singleton)
                 |> Result.combine
+                |> Result.mapError List.concat
+                |> Result.map ignore
 
-            return results
+            return! results
         }
 
     // start "data" "output" "templates/test.tmpl"
@@ -93,7 +101,9 @@ module Main =
 
         match start markdownPath outputPath with
         | Ok _ -> printfn "Blog written successfully to %s." outputPath
-        | Error e -> List.iter (printfn "%O") e
+        | Error e ->
+            printfn "ERROR - Could not generate blog for the following reasons:"
+            List.iter (printfn "%O") e
 
         0
 

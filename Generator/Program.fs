@@ -2,9 +2,12 @@
 
 module Shared =
 
+    /// When we build the site, we might have more than one failure.
+    /// We might also want to note in which faile the failure occured.
     type Failure =
         | Failure of string
-        | FailureWithMessage of string * string
+        | FailureWithSourceFile of string * Failure
+        | MultipleFailures of Failure list
 
     type Result<'a, 'b> with
 
@@ -28,11 +31,25 @@ module Shared =
 
             List.fold folder (Ok []) input
 
+    /// Boilerplate to catch exceptions into result types which are used for
+    /// monadic error handling.
+    let tryWith<'a> (f: unit -> 'a) errMsg : Result<'a, Failure> =
+        try
+            Ok(f ())
+        with ex ->
+            let msg = sprintf "%s: %s" errMsg ex.Message
+            Error(Failure msg)
+
+    let readAllText path =
+        tryWith (fun () -> System.IO.File.ReadAllText(path)) (sprintf "could not read file %s" path)
+
 module Yaml =
 
+    open Shared
     open YamlDotNet
     open YamlDotNet.Serialization.NamingConventions
 
+    /// For deserialising a YAML string.
     let deserialise<'T> (input: string) =
         let deserialiser =
             Serialization
@@ -40,22 +57,25 @@ module Yaml =
                 .WithNamingConvention(CamelCaseNamingConvention.Instance)
                 .Build()
 
-        try
-            Ok(deserialiser.Deserialize<'T> input)
-        with e ->
-            let str = sprintf "could not deserialise front matter: %s" e.Message
-            Error str
+        tryWith (fun () -> deserialiser.Deserialize<'T> input) "could not deserialise front matter"
 
 module Markdown =
 
+    open Shared
     open System.IO
     open Markdig
+    open FSharpx.Result
 
+    type Parsed = { Yaml: string; Html: string }
+
+    /// Parses a string into a Markdig abstract syntax tree, which can
+    /// be used for rendering and pulling out the front matter.
     let private parse (pipeline: MarkdownPipeline) fileName =
+        // Markdown.Parse should never throw.
         let parseFn s = Markdown.Parse(s, pipeline)
-        // TODO: Handle any exceptions from ReadAllText.
-        fileName |> File.ReadAllText |> parseFn
+        fileName |> readAllText |> Result.map parseFn
 
+    /// Renders a Markdig abstract syntax tree to a string.
     let private render (pipeline: MarkdownPipeline) ast =
         let sw = new StringWriter()
         let renderer = new Renderers.HtmlRenderer(sw)
@@ -64,24 +84,41 @@ module Markdown =
         sw.Flush()
         sw.ToString()
 
+    /// Checks whether the supplied syntax block is a front matter and if so
+    /// returns it as a sstring. A missing front matter will report back an
+    /// error for the markdown file in question when generating the website.
     let private frontMatter (block: Syntax.Block) =
         match block with
         | :? Extensions.Yaml.YamlFrontMatterBlock as b -> Ok(b.Lines.ToString())
-        | _ -> Error "front matter missing"
+        | _ -> Error(Failure "front matter missing")
 
+    /// Creates an instance of a parser to be used later. We create the pipeline
+    /// once and close over it to save doing it for every markdown file.
     let newParser =
         let pipeline = MarkdownPipelineBuilder().UseYamlFrontMatter().Build()
         let rendererWithPipeline = render pipeline
         let parserWithPipeline = parse pipeline
 
+        // Returns the front matter and html if there's
+        // no error when parsing the front matter.
         fun fileName ->
-            let ast = parserWithPipeline fileName
-            ast |> Seq.head |> frontMatter, ast |> rendererWithPipeline
+            result {
+                let! ast = parserWithPipeline fileName
+                let! yaml = ast |> Seq.head |> frontMatter
+                let html = ast |> rendererWithPipeline
+
+                return { Yaml = yaml; Html = html }
+            }
 
 module Post =
 
     open Shared
+    open Markdown
+    open FSharpx.Result
 
+    /// Contains all the items expected to be in the FrontMatter.
+    /// If any are missing or don't pass teh validation checks
+    /// then an error is logged.
     [<CLIMutable>]
     type FrontMatter =
         { Title: string
@@ -93,36 +130,57 @@ module Post =
 
     type Post =
         { FrontMatter: FrontMatter
-          Content: string }
+          Content: string
+          URL: string }
 
         static member withSource(post: Post) = post.FrontMatter.Source, post
 
     let private validateTitle input =
-        if input.Title = "" then Error "title missing" else Ok input
+        if input.Title = "" then
+            Error(Failure "title missing")
+        else
+            Ok input
 
     let private validateSlug input =
-        if input.Slug = "" then Error "slug missing" else Ok input
+        if input.Slug = "" then
+            Error(Failure "slug missing")
+        else
+            Ok input
 
+    /// Composes a validator out of smaller validator functions. Each one returns
+    /// the original Record type but fails fast if an error is encountered.
     let private validate input =
         input |> validateTitle |> Result.bind validateSlug
 
-    let fromMarkdown fileName =
-        let parse = Markdown.newParser
-        let yaml, html = parse fileName
+    let fromMarkdown (parseFn: string -> Result<Parsed, Failure>) fileName =
+        let post =
+            result {
+                let! { Yaml = yaml; Html = html } = parseFn fileName
+                let! unvalidated = Yaml.deserialise<FrontMatter> yaml
+                let! validated = validate unvalidated
 
-        yaml
-        |> Result.bind Yaml.deserialise<FrontMatter>
-        |> Result.bind validate
-        |> Result.map (fun it -> { FrontMatter = it; Content = html })
-        |> Result.mapError (fun it -> FailureWithMessage(fileName, it))
+                let url =
+                    sprintf "%d/%d/%d/%s" validated.Date.Year validated.Date.Month validated.Date.Day validated.Slug
+
+                return
+                    { FrontMatter = validated
+                      Content = html
+                      URL = url }
+            }
+
+        post |> Result.mapError (fun it -> FailureWithSourceFile(fileName, it))
+
 
 module Templates =
 
+    open Shared
     open Scriban
     open System.IO
     open Scriban.Runtime
     open System.Threading.Tasks
 
+    /// A map of all the templates the site uses. When a new (non-page)
+    /// templated is added then it must be added here.
     let initialTemplates =
         Map
             [ "base", "templates/base.tmpl"
@@ -130,15 +188,22 @@ module Templates =
 
     /// Map of name to filename. E.g.
     /// base -> templates/base.tmpl
-    /// page -> templates/post.tmpl / index.tmpl
-    /// partials/xyz -> templates/partials/xyz.tmpl ->
+    /// page/post -> templates/page/post.tmpl
+    /// page/home -> templates/page/home.tmpl
+    /// partials/xyz -> templates/partials/xyz.tmpl
+    ///
+    /// This type is used by Scriban to load templates at runtime. Apparently,
+    /// `getPath` and `load` are split up to allow caching of the templates.
+    ///
+    /// Presumably Scriban handles any exceptions here or they bubble up
+    /// to the Render function call for me to handle.
     type IncludeTemplates(templateMap: Map<string, string>) =
 
         interface ITemplateLoader with
             member this.GetPath(context, callerSpan, templateName) =
                 match templateMap.TryFind(templateName) with
                 | Some path -> path
-                | None -> ""
+                | None -> invalidArg "templateName" (sprintf "could not find template with name %s" templateName)
 
             member this.Load(context, callerSpan, templatePath) = File.ReadAllText(templatePath)
 
@@ -147,74 +212,71 @@ module Templates =
 
     let newTemplate =
         let path = initialTemplates.Item("base")
-        Template.Parse(File.ReadAllText(path), path)
+        readAllText path |> Result.map (fun it -> Template.Parse(it, path))
 
     let newContext templatePath =
         let context = TemplateContext(MemberRenamer = fun m -> m.Name)
         let templates = initialTemplates.Add("main", templatePath)
         context.TemplateLoader <- IncludeTemplates(templates)
-        System.Console.WriteLine(templates)
         context
+
+    let addData<'T> (context: TemplateContext) key (data: 'T) =
+        let scriptObject = ScriptObject()
+        scriptObject.Add(key, data)
+        context.PushGlobal(scriptObject)
+
+    let tryRender (template: Scriban.Template) context =
+        tryWith (fun () -> template.Render(context)) "template rendering failed"
+
 
 module Generator =
 
     open System.IO
-    open Scriban.Runtime
     open Shared
     open FSharpx.Result
 
     let createDir path =
-        try
-            Directory.CreateDirectory(path) |> ignore
-            Ok()
-        with e ->
-            let str = sprintf "could not create output directory: %s" e.Message
-            Error(Failure str)
+        tryWith (fun () -> Directory.CreateDirectory(path) |> ignore) "could not create output directory"
 
     let writeFile path contents =
-        try
-            File.WriteAllText(path, contents)
-            Ok()
-        with e ->
-            let str = sprintf "could not write to %s: %s" path e.Message
-            Error(Failure str)
+        tryWith (fun () -> File.WriteAllText(path, contents)) (sprintf "could not write to %s" path)
 
-    let staticGenerator templatePath outputPath url =
+    let staticPage templatePath outputPath url =
         result {
-            let template = Templates.newTemplate
+            let! template = Templates.newTemplate
             let context = Templates.newContext templatePath
-            let result = template.Render(context)
+            let! result = Templates.tryRender template context
             let folder = Path.Combine(outputPath, url)
-            let combined = Path.Combine(folder, "index.html")
+            let path = Path.Combine(folder, "index.html")
             do! createDir folder
-            do! writeFile combined result
+            do! writeFile path result
         }
 
     let postGenerator templatePath outputPath (posts: Post.Post list) =
-        let template = Templates.newTemplate
-        let context = Templates.newContext templatePath
 
-        let postPath outputPath (p: Post.Post) =
-            let fm = p.FrontMatter
-            sprintf "%s/%d/%d/%d/%s" outputPath fm.Date.Year fm.Date.Month fm.Date.Day fm.Slug
-
+        // TODO: This and the above in staticPage can be merged.
         let generate (post: Post.Post) =
             result {
-                System.Console.WriteLine(post)
-                let scriptObject = ScriptObject()
-                scriptObject.Add("Post", post)
-                context.PushGlobal(scriptObject)
-                let result = template.Render(context)
-                let postFolder = postPath outputPath post
-                let combined = Path.Combine(postFolder, "index.html")
-                do! createDir postFolder
-                do! writeFile combined result
+                let! template = Templates.newTemplate
+                let context = Templates.newContext templatePath
+                Templates.addData context "Post" post
+                let! result = Templates.tryRender template context
+                let folder = Path.Combine(outputPath, post.URL)
+                let path = Path.Combine(folder, "index.html")
+                do! createDir folder
+                do! writeFile path result
             }
 
-        result {
-            let! d = posts |> List.map generate |> Result.combine |> Result.map ignore
-            return d
-        }
+        result { return! posts |> List.map generate |> Result.combine |> Result.map ignore }
 
-// let generateIndex (posts: Post.Post list) =
-//     let firstTen = posts |> List.sortBy (fun it -> it.FrontMatter.Date) |> List.take 10 |>
+    let homeGenerator templatePath outputPath (posts: Post.Post list) =
+        let firstTen = posts |> List.sortBy (fun it -> it.FrontMatter.Date) |> List.take 3
+
+        result {
+            let! template = Templates.newTemplate
+            let context = Templates.newContext templatePath
+            Templates.addData context "Posts" firstTen
+            let! result = Templates.tryRender template context
+            let path = Path.Combine(outputPath, "index.html")
+            do! writeFile path result
+        }
